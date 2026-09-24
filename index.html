@@ -1543,6 +1543,10 @@ const actions = {
     } else {
       row.done = true;
       saveSet(slot, row);
+      // Las series que siguen arrancan con lo que acabás de levantar.
+      for (const r of rowsFor(slot)) {
+        if (!r.done && r.set_index > row.set_index) { r.weight_kg = row.weight_kg; r.reps = row.reps; }
+      }
       startRest();
     }
     renderToday();
