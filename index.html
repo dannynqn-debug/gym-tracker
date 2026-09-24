@@ -528,7 +528,8 @@ function fmtDuration(sec) {
   if (s < 60) return 'menos de 1 min';
   const h = Math.floor(s / 3600);
   const m = Math.floor((s % 3600) / 60);
-  return h ? `${h} h ${m} min` : `${m} min`;
+  if (!h) return `${m} min`;
+  return m ? `${h} h ${m} min` : `${h} h`;
 }
 
 function mmss(sec) {
@@ -619,6 +620,7 @@ const state = {
   previewValues: {},     // kilos y reps tocados antes de arrancar el entreno: { 'slot|serie': {kg, reps} }
   current: null,         // entreno en curso
   summary: null,
+  openWorkout: null,      // entreno abierto en el detalle del historial
   loading: true,
 };
 
@@ -677,6 +679,18 @@ const db = {
       return;
     }
     const { error } = await sb.from('workout_sets').upsert(s);
+    if (error) throw error;
+  },
+  async deleteWorkout(id) {
+    if (DEMO) {
+      const d = demoLoad();
+      d.workouts = (d.workouts || []).filter((w) => w.id !== id);
+      d.sets = (d.sets || []).filter((s) => s.workout_id !== id);
+      demoSave(d);
+      return;
+    }
+    // workout_sets tiene borrado en cascada: alcanza con borrar el entreno.
+    const { error } = await sb.from('workouts').delete().eq('id', id);
     if (error) throw error;
   },
   async deleteSet(id) {
@@ -1011,6 +1025,8 @@ function render() {
   if (!state.profile.onboarded) return renderOnboarding();
   renderTabbar();
   if (state.view === 'summary') return renderSummary();
+  if (state.view === 'history') return renderHistory();
+  if (state.view === 'workout') return renderWorkoutDetail();
   if (state.tab === 'hoy') renderToday();
   else if (state.tab === 'progreso') renderProgress();
   else renderCatalog();
@@ -1269,6 +1285,99 @@ function chartFor(exerciseId) {
   </svg>`;
 }
 
+// Fecha corta ("mar 23 sept") y mes para agrupar ("Septiembre 2026")
+function fmtDay(date) {
+  return new Date(date).toLocaleDateString('es-AR', { weekday: 'short', day: 'numeric', month: 'short' });
+}
+function fmtMonth(date) {
+  const s = new Date(date).toLocaleDateString('es-AR', { month: 'long', year: 'numeric' });
+  return s.charAt(0).toUpperCase() + s.slice(1);
+}
+
+// Lo que se hizo en un entreno, agrupado por ejercicio y en el orden de la sesión.
+function workoutDetail(workoutId) {
+  const w = state.data.workouts.find((x) => x.id === workoutId);
+  if (!w) return null;
+  const rows = state.data.sets.filter((s) => s.workout_id === workoutId && s.done);
+  const slots = [];
+  for (const s of rows.sort((a, b) => a.slot_index - b.slot_index || a.set_index - b.set_index)) {
+    let g = slots.find((x) => x.slot === s.slot_index && x.exercise_id === s.exercise_id);
+    if (!g) { g = { slot: s.slot_index, exercise_id: s.exercise_id, rows: [] }; slots.push(g); }
+    g.rows.push(s);
+  }
+  return { workout: w, slots, sets: rows.length, volume: volumeOf(rows) };
+}
+
+function workoutRow(w) {
+  const rows = state.data.sets.filter((s) => s.workout_id === w.id && s.done);
+  const session = ROUTINES[w.routine]?.sessions[w.day_key];
+  return `<button class="cat-item" data-action="open-workout" data-value="${w.id}">
+    <span class="badge" aria-hidden="true">${esc((session?.name || '?').slice(0, 2).toUpperCase())}</span>
+    <span class="ex-name"><strong>${esc(session?.name || w.day_key)}</strong><span>${fmtDay(w.started_at)} · ${rows.length} series${w.duration_sec ? ` · ${fmtDuration(w.duration_sec)}` : ''}</span></span>
+    <span class="sets num muted">${fmtKg(w.total_volume_kg ?? volumeOf(rows))} kg</span>
+  </button>`;
+}
+
+function renderHistory() {
+  const done = state.data.workouts
+    .filter((w) => w.finished_at)
+    .sort((a, b) => new Date(b.started_at) - new Date(a.started_at));
+
+  if (!done.length) {
+    root.innerHTML = `${topBar('Historial', 'Entrenos')}
+      <div class="empty">
+        <p class="muted">Todavía no terminaste ningún entreno.</p>
+        <button class="btn btn-secondary" data-action="tab" data-value="hoy">Ir a Hoy</button>
+      </div>`;
+    return;
+  }
+
+  let html = '';
+  let month = null;
+  for (const w of done) {
+    const m = fmtMonth(w.started_at);
+    if (m !== month) { month = m; html += `<h3 class="group-title">${esc(m)}</h3>`; }
+    html += workoutRow(w);
+  }
+
+  const totalVol = done.reduce((acc, w) => acc + Number(w.total_volume_kg || 0), 0);
+  root.innerHTML = `${topBar('Historial', 'Entrenos')}
+    <div class="metrics" style="grid-template-columns:1fr 1fr">
+      <div class="metric"><strong>${done.length}</strong><span>Entrenos</span></div>
+      <div class="metric"><strong>${fmtKg(totalVol)}</strong><span>Volumen total (kg)</span></div>
+    </div>
+    ${html}
+    <div class="inline-actions"><button class="btn-link" data-action="back-progress">Volver a Progreso</button></div>`;
+}
+
+function renderWorkoutDetail() {
+  const d = workoutDetail(state.openWorkout);
+  if (!d) { state.view = 'history'; return renderHistory(); }
+  const { workout: w, slots } = d;
+  const session = ROUTINES[w.routine]?.sessions[w.day_key];
+
+  root.innerHTML = `${topBar(fmtDay(w.started_at), session?.name || w.day_key)}
+    <div class="metrics">
+      <div class="metric"><strong>${fmtKg(w.total_volume_kg ?? d.volume)}</strong><span>Volumen (kg)</span></div>
+      <div class="metric"><strong>${d.sets}</strong><span>Series</span></div>
+      <div class="metric"><strong>${w.duration_sec ? fmtDuration(w.duration_sec).replace(' min', '′').replace('menos de 1′', '<1′') : '—'}</strong><span>Duración</span></div>
+    </div>
+    <div class="list">${slots.map((g) => {
+      const ex = EX[g.exercise_id];
+      return `<article class="ex">
+        <div class="ex-head">
+          <span class="badge" aria-hidden="true">${ex ? GROUPS[ex.group].short : '?'}</span>
+          <div class="ex-name"><strong>${esc(ex ? ex.name : g.exercise_id)}</strong><span>${g.rows.length} series</span></div>
+        </div>
+        <div class="muted num small">${g.rows.map((r) => `${fmtKg(r.weight_kg)}kg×${r.reps}`).join(' · ')}</div>
+      </article>`;
+    }).join('')}</div>
+    <div class="inline-actions">
+      <button class="btn-link" data-action="back-history">Volver al historial</button>
+      <button class="btn-link" data-action="delete-workout" data-value="${w.id}" style="color:var(--danger)">Borrar este entreno</button>
+    </div>`;
+}
+
 function renderProgress() {
   finishHost.innerHTML = '';
   const done = state.data.sets.filter((s) => s.done);
@@ -1288,6 +1397,9 @@ function renderProgress() {
   const lastWeek = weekVolume(done, 1);
   const delta = lastWeek ? Math.round(((thisWeek - lastWeek) / lastWeek) * 100) : null;
 
+  const finished = state.data.workouts
+    .filter((w) => w.finished_at)
+    .sort((a, b) => new Date(b.started_at) - new Date(a.started_at));
   const withHistory = [...new Set(done.map((s) => s.exercise_id))].filter((id) => EX[id]);
   if (!state.chartExercise || !withHistory.includes(state.chartExercise)) state.chartExercise = withHistory[0];
 
@@ -1317,7 +1429,12 @@ function renderProgress() {
       <span class="badge" aria-hidden="true">${GROUPS[EX[p.id].group].short}</span>
       <span class="ex-name"><strong>${esc(EX[p.id].name)}</strong><span class="num">${fmtKg(p.last.weight_kg)} kg × ${p.last.reps}</span></span>
       <span class="tag ${p.trend === 'sube' ? 'partial' : p.trend === 'baja' ? 'forbidden' : 'plain'}">${p.trend === 'sube' ? '↑ sube' : p.trend === 'baja' ? '↓ baja' : p.trend === 'igual' ? '= igual' : 'nuevo'}</span>
-    </button>`).join('')}</div>`;
+    </button>`).join('')}</div>
+
+    <h3 class="group-title">Últimos entrenos</h3>
+    <div>${finished.slice(0, 5).map(workoutRow).join('')}</div>
+    ${finished.length > 5 ? `<div class="inline-actions"><button class="btn-link" data-action="history-all">Ver los ${finished.length} entrenos</button></div>`
+      : '<div class="inline-actions"><button class="btn-link" data-action="history-all">Ver el historial completo</button></div>'}`;
 }
 
 function renderCatalog() {
@@ -1585,6 +1702,22 @@ const actions = {
   'go-progress': () => { state.view = 'main'; state.tab = 'progreso'; render(); window.scrollTo(0, 0); },
   'go-home': () => { state.view = 'main'; state.tab = 'hoy'; state.overrideKey = null; render(); window.scrollTo(0, 0); },
   history: (v) => openHistory(v),
+  'history-all': () => { state.view = 'history'; state.tab = 'progreso'; render(); window.scrollTo(0, 0); },
+  'open-workout': (v) => { state.openWorkout = v; state.view = 'workout'; render(); window.scrollTo(0, 0); },
+  'back-progress': () => { state.view = 'main'; state.tab = 'progreso'; render(); window.scrollTo(0, 0); },
+  'back-history': () => { state.view = 'history'; render(); window.scrollTo(0, 0); },
+  'delete-workout': async (id) => {
+    const d = workoutDetail(id);
+    if (!d) return;
+    const name = ROUTINES[d.workout.routine]?.sessions[d.workout.day_key]?.name || '';
+    if (!confirm(`¿Borrar el entreno de ${name} del ${fmtDay(d.workout.started_at)}? Se pierden sus ${d.sets} series.`)) return;
+    state.data.workouts = state.data.workouts.filter((w) => w.id !== id);
+    state.data.sets = state.data.sets.filter((s) => s.workout_id !== id);
+    state.view = 'history';
+    render();
+    try { await db.deleteWorkout(id); }
+    catch (err) { console.warn(err); toast('No se pudo borrar en la nube. Revisá la conexión y probá de nuevo.'); }
+  },
 };
 
 // El entreno se inicia al tocar la primera serie: ahí se crea la fila en workouts.
